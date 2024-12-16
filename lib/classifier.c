@@ -977,7 +977,47 @@ classifier_lookup__(const struct classifier *cls, ovs_version_t version,
     const struct cls_match *match;
     /* Highest-priority flow in 'cls' that certainly matches 'flow'. */
     const struct cls_match *hard = NULL;
+    //设为最低优先级
     int hard_pri = INT_MIN;     /* hard ? hard->priority : INT_MIN. */
+
+    //wc通配符，报文起始查找时是通配所有的，在整个报文匹配中使用同一个wc，
+    //命中一个规则就将该规则对应的掩码unwildcard，表示报文需要匹配这些域，
+    //当报文通过goto和resubmit动作转移到另外一个table时，
+    //依然会使用原来的上个table处理后的wc继续处理，多个规则之间的mask采用或的关系处理wc。
+    //wc与flow共同构成快转表中规则的value与mask。
+    //对于那些不用生成megaflow的使用场景，该值可以为NULL
+
+    //下面几个变量用来处理联合规则
+    //conjunction主要作用是为了减少规则的数量，类似数据库分表的概念。
+    //将原先的规则数量由乘积减少到加
+    //下面是openflow给出的一个使用场景：
+    //OpenFlow controller:
+    //ip,ip_src=a actions=controller
+    //ip,ip_src=b actions=controller
+    //ip,ip_src=c actions=controller
+    //ip,ip_src=d actions=controller
+
+    //Similarly, these flows send packets with IP destination address
+    //e, f, g, or h to the OpenFlow controller:
+
+    //ip,ip_dst=e actions=controller
+    //ip,ip_dst=f actions=controller
+    //ip,ip_dst=g actions=controller
+    //ip,ip_dst=h actions=controller
+    //Suppose, on the other hand, one wishes to match conjunctively,
+    //that is, to send a packet to the controller only if both ip_src ∈
+    //{a,b,c,d} and ip_dst ∈ {e,f,g,h}. This requires 4 × 4 = 16 flows,
+    //one for each possible pairing of ip_src and ip_dst
+
+    //			conj_id=1234 actions=controller
+    //             ip,ip_src=10.0.0.1 actions=conjunction(1234, 1/2)
+    //             ip,ip_src=10.0.0.4 actions=conjunction(1234, 1/2)
+    //             ip,ip_src=10.0.0.6 actions=conjunction(1234, 1/2)
+    //             ip,ip_src=10.0.0.7 actions=conjunction(1234, 1/2)
+    //             ip,ip_dst=10.0.0.2 actions=conjunction(1234, 2/2)
+    //             ip,ip_dst=10.0.0.5 actions=conjunction(1234, 2/2)
+    //             ip,ip_dst=10.0.0.7 actions=conjunction(1234, 2/2)
+    //             ip,ip_dst=10.0.0.8 actions=conjunction(1234, 2/2)
 
     /* Highest-priority conjunctive flows in 'cls' matching 'flow'.  Since
      * these are (components of) conjunctive flows, we can only know whether
@@ -998,20 +1038,33 @@ classifier_lookup__(const struct classifier *cls, ovs_version_t version,
         trie_ctx_init(&trie_ctx[i], &cls->tries[i]);
     }
 
+    //遍历子表优先级数组
     /* Main loop. */
+    //PVECTOR_FOR_EACH_PRIORITY内部会检查vector内部记录的rule最大的priority是否大于上次记录的hard_pri
+    //如果<=hard_pri则结束匹配，这里实现了PSTSS算法
     struct cls_subtable *subtable;
     PVECTOR_FOR_EACH_PRIORITY (subtable, hard_pri + 1, 2, sizeof *subtable,
                                &cls->subtables) {
         struct cls_conjunction_set *conj_set;
 
+        //wc通配符，报文起始查找时是通配所有的，在整个报文匹配中使用同一个wc，
+		//命中一个规则就将该规则对应的掩码unwildcard，表示报文需要匹配这些域，
+		//当报文通过goto和resubmit动作转移到另外一个table时，
+		//依然会使用原来的上个table处理后的wc继续处理，
+		//多个规则之间的mask采用或的关系处理wc。wc与flow共同构成快转表中规则的value与mask。
+		//wc非常重要，它最大限度的用来减少误匹配。对于那些不用生成megaflow的使用场景，该值可以为NULL，
+		//所以ovs_router_lookup中该值为NULL。
         /* Skip subtables with no match, or where the match is lower-priority
          * than some certain match we've already found. */
         match = find_match_wc(subtable, version, flow, trie_ctx, cls->n_tries,
                               wc);
+        //没有匹配的，或者匹配到的优先级比上次的低，则继续查找下一个subtable
+		//PSTSS最坏的情况和TSS一样，可能需要全扫描
         if (!match || match->priority <= hard_pri) {
             continue;
         }
-
+        //如果flow包含了联合action，则不能有其他的action设置
+		//获取规则的联合匹配
         conj_set = ovsrcu_get(struct cls_conjunction_set *, &match->conj_set);
         if (!conj_set) {
             /* 'match' isn't part of a conjunctive match.  It's the best
@@ -1020,9 +1073,12 @@ classifier_lookup__(const struct classifier *cls, ovs_version_t version,
              *
              * (There might be a higher-priority conjunctive match.  We can't
              * tell yet.) */
+        	//没有关联匹配，记录当前匹配的match和优先级为当前最优结果
             hard = match;
             hard_pri = hard->priority;
         } else if (allow_conjunctive_matches) {
+        	//允许关联匹配
+        	//空间不够，重新分配
             /* 'match' is part of a conjunctive match.  Add it to the list. */
             if (OVS_UNLIKELY(n_soft >= allocated_soft)) {
                 struct cls_conjunction_set **old_soft = soft;
@@ -1034,15 +1090,20 @@ classifier_lookup__(const struct classifier *cls, ovs_version_t version,
                     free(old_soft);
                 }
             }
+            //记录命中的conj规则
             soft[n_soft++] = conj_set;
 
+            //记录命中的最高优先级的soft macth rule
             /* Keep track of the highest-priority soft match. */
             if (soft_pri < match->priority) {
                 soft_pri = match->priority;
             }
+            //注意这里不改变hard_pri,会继续遍历子表subtable
         }
     }
 
+    //如果有命中的hard_pri且大于soft_pri，则hard_pri是最佳匹配，直接返回命中的hard rule
+    //如果hard_pri小于soft_pri，还需要进一步处理才能确定命中的最佳rule是谁
     /* In the common case, at this point we have no soft matches and we can
      * return immediately.  (We do the same thing if we have potential soft
      * matches but none of them are higher-priority than our hard match.) */
@@ -1057,6 +1118,7 @@ classifier_lookup__(const struct classifier *cls, ovs_version_t version,
      * match; if so, its priority is lower than the highest-priority soft
      * match. */
 
+    //检查软匹配是否是一个真实的全匹配，即关联规则的每一个维度都命中了，则软匹配升级为硬匹配
     /* Soft match loop.
      *
      * Check whether soft matches are real matches. */
@@ -1083,6 +1145,10 @@ classifier_lookup__(const struct classifier *cls, ovs_version_t version,
          * It's also tempting to break out of the soft match loop if 'n_soft ==
          * 1' but that would also miss lower-priority hard matches.  We could
          * special case that also but again there's no need. */
+    	//筛选符合条件的软匹配，
+		//过滤掉所有的优先级比硬匹配低的，意味着soft不可能是最佳匹配
+		//soft为NULL的的情况出现在外层第二轮大循环的情况下
+		//只保留优先级大于hard_pri的soft匹配
         for (int i = 0; i < n_soft; ) {
             if (!soft[i] || soft[i]->priority <= hard_pri) {
                 soft[i] = soft[--n_soft];
@@ -1090,21 +1156,26 @@ classifier_lookup__(const struct classifier *cls, ovs_version_t version,
                 i++;
             }
         }
+        //没有有效的软匹配，结束
         if (!n_soft) {
             break;
         }
 
+        //剩下的都是比hard_pri高的soft match
         /* Find the highest priority among the soft matches.  (We know this
          * must be higher than the hard match's priority; otherwise we would
          * have deleted all of the soft matches in the previous loop.)  Count
          * the number of soft matches that have that priority. */
         soft_pri = INT_MIN;
+        //记录最高的一个软匹配优先级及其个数
         int n_soft_pri = 0;
+        //先从所有的软匹配中找到一个最高优先级的软匹配
         for (int i = 0; i < n_soft; i++) {
             if (soft[i]->priority > soft_pri) {
                 soft_pri = soft[i]->priority;
                 n_soft_pri = 1;
             } else if (soft[i]->priority == soft_pri) {
+            	//记录有多个相同优先级的soft匹配
                 n_soft_pri++;
             }
         }
@@ -1119,10 +1190,12 @@ classifier_lookup__(const struct classifier *cls, ovs_version_t version,
         struct conjunctive_match cm_stubs[16];
         struct hmap matches;
 
+        //临时hash表，用于跟踪关联id
         hmap_init(&matches);
         for (int i = 0; i < n_soft; i++) {
             uint32_t id;
 
+            //循环处理为soft_pri的优先级规则，看是否能命中联合规则
             if (soft[i]->priority == soft_pri
                 && find_conjunctive_match(soft[i], n_soft_pri, &matches,
                                           cm_stubs, ARRAY_SIZE(cm_stubs),
@@ -1130,12 +1203,18 @@ classifier_lookup__(const struct classifier *cls, ovs_version_t version,
                 uint32_t saved_conj_id = flow->conj_id;
                 const struct cls_rule *rule;
 
+                //最终的关联id，根据关联id进行第二步查找
                 flow->conj_id = id;
+                //进行流表查找，不允许处理关联动作，因为前面已经处理过了
+				//也就是flow rule不能再嵌套关联
                 rule = classifier_lookup__(cls, version, flow, wc, false,
                                            NULL);
+                //恢复原来的id
                 flow->conj_id = saved_conj_id;
 
+                //命中rule，这里不和hard_pri比较优先级大小
                 if (rule) {
+                	//命中rule，为最佳结果，释放临时分配的空间，返回rule
                     if (allow_conjunctive_matches) {
                         insert_conj_flows(conj_flows, id, soft_pri, soft,
                                           n_soft);
@@ -1149,6 +1228,7 @@ classifier_lookup__(const struct classifier *cls, ovs_version_t version,
                 }
             }
         }
+        //释放联合规则临时分配的空间
         free_conjunctive_matches(&matches, cm_stubs, ARRAY_SIZE(cm_stubs));
 
         /* There's no real match among the highest-priority soft matches.
@@ -1159,33 +1239,42 @@ classifier_lookup__(const struct classifier *cls, ovs_version_t version,
          * The next iteration of the soft match loop will delete any null
          * pointers we put into 'soft' (and some others too). */
         for (int i = 0; i < n_soft; i++) {
+        	//只处理soft_pri的规则
             if (soft[i]->priority != soft_pri) {
                 continue;
             }
 
+            //从同样的匹配条件中找到下一个优先级的匹配，如果该匹配是关联匹配，则
+			//准备下一轮。否则作为硬匹配。
             /* Find next-lower-priority flow with identical flow match. */
             match = next_visible_rule_in_list(soft[i]->match, version);
             if (match) {
                 soft[i] = ovsrcu_get(struct cls_conjunction_set *,
                                      &match->conj_set);
+                //不是关联匹配
                 if (!soft[i]) {
                     /* The flow is a hard match; don't treat as a soft
                      * match. */
+                	//并且大于hard_pri，记录为当前最佳匹配
                     if (match->priority > hard_pri) {
                         hard = match;
                         hard_pri = hard->priority;
                     }
                 }
             } else {
+            	//删除当前的soft，后续不在匹配
                 /* No such lower-priority flow (probably the common case). */
                 soft[i] = NULL;
             }
+            //本次匹配失败，继续从剩下的soft中查找
         }
     }
 
     if (soft != soft_stub) {
         free(soft);
     }
+
+    //如果有命中的hard rule，则返回rule
     return hard ? hard->cls_rule : NULL;
 }
 
@@ -1209,6 +1298,10 @@ classifier_lookup(const struct classifier *cls, ovs_version_t version,
                   struct flow *flow, struct flow_wildcards *wc,
                   struct hmapx *conj_flows)
 {
+	//flow：需要匹配的报文的提取值，中途可以临时修改，但是最终是保持报文原样的，将来用来作为megaflow的key。
+	//
+	//参数wc是需要在classifier_lookup过程中赋值的，将查找分类器时用到的field mask保存到wc，以便下发megaflow时使用
+	//如果关闭了megaflow，那么wc全为1，退化为精确匹配
     return classifier_lookup__(cls, version, flow, wc, true, conj_flows);
 }
 
@@ -1224,17 +1317,24 @@ classifier_find_rule_exactly(const struct classifier *cls,
     const struct cls_match *head, *rule;
     const struct cls_subtable *subtable;
 
+    //根据mask生成hash值，找到子表
     subtable = find_subtable(cls, target->match.mask);
+    //子表不存在，返回
     if (!subtable) {
         return NULL;
     }
 
+    //hash flow查找match,比较miniflow的值是否相等
     head = find_equal(subtable, target->match.flow,
                       miniflow_hash_in_minimask(target->match.flow,
                                                 target->match.mask, 0));
     if (!head) {
         return NULL;
     }
+
+    //可能有多个match，所以需要遍历
+	//这里查找是否有key相同，但优先级不同的规则。如果优先级不同，key相同，认为是一条新rule
+	//要找到一个最佳匹配
     CLS_MATCH_FOR_EACH (rule, head) {
         if (rule->priority < target->priority) {
             break; /* Not found. */

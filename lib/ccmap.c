@@ -243,8 +243,12 @@ ccmap_find_slot_protected(struct ccmap_bucket *b, uint32_t hash,
     for (int i = 0; i < CCMAP_K; i++) {
         uint64_t node = ccmap_node_get_protected(&b->nodes[i]);
 
+        //64bit的node分成2个32bit
+        //高32位是计数
         *count = ccmap_node_count(node);
+        //低32位是hash值
         if (ccmap_node_hash(node) == hash && *count) {
+        	//返回数组索引
             return i;
         }
     }
@@ -332,6 +336,7 @@ other_bucket_protected(struct ccmap_impl *impl, struct ccmap_bucket *b, int slot
  * hash table, and a shortest path will never contain loops, so it avoids that
  * problem entirely.
  */
+//基于广度优先搜索（Breadth-First Search，BFS）算法来实现的
 static uint32_t
 ccmap_inc_bfs(struct ccmap_impl *impl, uint32_t hash,
               struct ccmap_bucket *b1, struct ccmap_bucket *b2, uint32_t inc)
@@ -456,10 +461,14 @@ ccmap_try_inc(struct ccmap_impl *impl, uint32_t hash, uint32_t inc)
 {
     uint32_t h1 = rehash(impl, hash);
     uint32_t h2 = other_hash(h1);
+    //基于传入的hash值计算2个hash值
     struct ccmap_bucket *b1 = &impl->buckets[h1 & impl->mask];
     struct ccmap_bucket *b2 = &impl->buckets[h2 & impl->mask];
     uint32_t count;
 
+    //先查看2个hash值是否存在。若存在，直接增加hash值的引用计数
+    //若都不存在，先尝试插入h1, 若失败，尝试插入h2，
+    //若插入都失败
     return OVS_UNLIKELY(count = ccmap_inc_bucket_existing(b1, hash, inc))
         ? count : OVS_UNLIKELY(count = ccmap_inc_bucket_existing(b2, hash, inc))
         ? count : OVS_LIKELY(count = ccmap_inc_bucket_new(b1, hash, inc))
@@ -477,15 +486,21 @@ ccmap_inc(struct ccmap *ccmap, uint32_t hash)
     struct ccmap_impl *impl = ccmap_get_impl(ccmap);
     uint32_t count;
 
+    //插入的hash值超过最大允许值，扩大hash表
     if (OVS_UNLIKELY(impl->n_unique >= impl->max_n)) {
         COVERAGE_INC(ccmap_expand);
         impl = ccmap_rehash(ccmap, (impl->mask << 1) | 1);
     }
 
+    //插入失败，扩大hash表后在尝试插入直到成功插入
     while (OVS_UNLIKELY(!(count = ccmap_try_inc(impl, hash, 1)))) {
         impl = ccmap_rehash(ccmap, impl->mask);
     }
+    //插入的hash值的数量，这里包括重复插入的hash值
     ++impl->n;
+
+    //插入的hash值的计数，如果为1，表示当前插入的hash值是唯一的
+    //n_unique记录当前有多少个唯一的hash值
     if (count == 1) {
         ++impl->n_unique;
     }

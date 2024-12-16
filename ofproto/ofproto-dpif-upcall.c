@@ -223,8 +223,11 @@ struct upcall {
      * may be used with other datapaths. */
     const struct flow *flow;       /* Parsed representation of the packet. */
     enum odp_key_fitness fitness;  /* Fitness of 'flow' relative to ODP key. */
+    //拷贝dpif_upcall的ufid
+	//upcall的报文会hash在dpif_upcall中生成一个ufid
     const ovs_u128 *ufid;          /* Unique identifier for 'flow'. */
     unsigned pmd_id;               /* Datapath poll mode driver id. */
+    //指向收到的packet
     const struct dp_packet *packet;   /* Packet associated with this upcall. */
     ofp_port_t ofp_in_port;        /* OpenFlow in port, or OFPP_NONE. */
     uint16_t mru;                  /* If !0, Maximum receive unit of
@@ -236,14 +239,21 @@ struct upcall {
 
     bool xout_initialized;         /* True if 'xout' must be uninitialized. */
     struct xlate_out xout;         /* Result of xlate_actions(). */
+    //datapath action，注意和put_actions的区别是odp_actions是通知内核对当前upcall的报文如何做处理
+	//而put_actions是控制安装流表用于后续报文的处理，不涉及对当前upcall的报文如何处理
     struct ofpbuf odp_actions;     /* Datapath actions from xlate_actions(). */
+
     struct flow_wildcards wc;      /* Dependencies that megaflow must match. */
+
+    //put_actions是控制安装流表用于后续报文的处理，不涉及对当前upcall的报文如何处理
+	//通常情况下，put_actions会指向odp_actions
     struct ofpbuf put_actions;     /* Actions 'put' in the fastpath. */
 
     struct dpif_ipfix *ipfix;      /* IPFIX pointer or NULL. */
     struct dpif_sflow *sflow;      /* SFlow pointer or NULL. */
 
     struct udpif_key *ukey;        /* Revalidator flow cache. */
+    //upcall_uninit中告诉upcall要不要删除ukey
     bool ukey_persists;            /* Set true to keep 'ukey' beyond the
                                       lifetime of this upcall. */
 
@@ -299,23 +309,31 @@ enum flow_del_reason {
  * itself is protected by RCU and is held within a umap in the parent udpif.
  * Adding or removing a ukey from a umap is only safe when holding the
  * corresponding umap lock. */
+//ukey代表了一条下发到datapath的flow
 struct udpif_key {
     struct cmap_node cmap_node;     /* In parent revalidator 'ukeys' map. */
 
     /* These elements are read only once created, and therefore aren't
      * protected by a mutex. */
+    //保存key
     const struct nlattr *key;      /* Datapath flow key. */
     size_t key_len;                /* Length of 'key'. */
+    //保存掩码
     const struct nlattr *mask;     /* Datapath flow mask. */
     size_t mask_len;               /* Length of 'mask'. */
+    //udpif_key分配唯一的ukey id
     ovs_u128 ufid;                 /* Unique flow identifier. */
     bool ufid_present;             /* True if 'ufid' is in datapath. */
+    //保存hash值
     uint32_t hash;                 /* Pre-computed hash for 'key'. */
     unsigned pmd_id;               /* Datapath poll mode driver id. */
 
+    //ueky锁
     struct ovs_mutex mutex;                   /* Guards the following. */
+    //保存统计值
     struct dpif_flow_stats stats OVS_GUARDED; /* Last known stats.*/
     const char *dp_layer OVS_GUARDED;         /* Last known dp_layer. */
+    //ukey的创建时间，ms
     long long int created OVS_GUARDED;        /* Estimate of creation time. */
     uint64_t dump_seq OVS_GUARDED;            /* Tracks udpif->dump_seq. */
     uint64_t reval_seq OVS_GUARDED;           /* Tracks udpif->reval_seq. */
@@ -328,11 +346,15 @@ struct udpif_key {
 
     /* Datapath flow actions as nlattrs.  Protected by RCU.  Read with
      * ukey_get_actions(), and write with ukey_set_actions(). */
+    //保存action
     OVSRCU_TYPE(struct ofpbuf *) actions;
 
+    //指向cache，用于保存原来命中的多条rule或者其他映射关系，方便映射做数据统计
     struct xlate_cache *xcache OVS_GUARDED;   /* Cache for xlate entries that
                                                * are affected by this ukey.
                                                * Used for stats and learning.*/
+
+    //申请2个buf用于保存key和mask
     union {
         struct odputil_keybuf buf;
         struct nlattr nla;
@@ -1292,6 +1314,10 @@ upcall_xlate(struct udpif *udpif, struct upcall *upcall,
     stats.used = time_msec();
     stats.tcp_flags = ntohs(upcall->flow->tcp_flags);
 
+    //upcall->in_port为ovs的flow port
+	//注意和datapath port区分开
+	//修改flow的inport为ovs的inport
+	//从upcall中拷贝flow到xin中
     xlate_in_init(&xin, upcall->ofproto,
                   ofproto_dpif_get_tables_version(upcall->ofproto),
                   upcall->flow, upcall->ofp_in_port, NULL,
@@ -1299,7 +1325,10 @@ upcall_xlate(struct udpif *udpif, struct upcall *upcall,
 
     if (upcall->type == MISS_UPCALL) {
         xin.resubmit_stats = &stats;
-
+        //xlate_in_init中查找recirc
+		//下发到datapath的action中会添加OVS_ACTION_ATTR_RECIRC唯一的id，用来查找recirc_id_node对象
+		//recirc用于什么场景？最总目的是想把命中datapath后的报文upcall再到ovs处理一次
+		//OFPACT_CT会用到
         if (xin.frozen_state) {
             /* We may install a datapath flow only if we get a reference to the
              * recirculation context (otherwise we could have recirculation
@@ -1317,8 +1346,10 @@ upcall_xlate(struct udpif *udpif, struct upcall *upcall,
          * with pushing its stats eventually. */
     }
 
+    //获取当前的seq,seq会拷贝到ukey中
     upcall->reval_seq = seq_read(udpif->reval_seq);
 
+    //调用xlate_actions，生成datapath需要的struct xlate_out
     xerr = xlate_actions(&xin, &upcall->xout);
 
     /* Translate again and log the ofproto trace for
@@ -1351,10 +1382,15 @@ upcall_xlate(struct udpif *udpif, struct upcall *upcall,
     if (upcall->fitness == ODP_FIT_TOO_LITTLE) {
         upcall->xout.slow |= SLOW_MATCH;
     }
+
+
+    //需要下发datapath的情况
+    //case1：设置put_actions指向odp_actions
     if (!upcall->xout.slow) {
         ofpbuf_use_const(&upcall->put_actions,
                          odp_actions->data, odp_actions->size);
     } else {
+    	//xout.slow非0，处理slow path的情况
         /* upcall->put_actions already initialized by upcall_receive(). */
         compose_slow_path(udpif, &upcall->xout,
                           upcall->flow->in_port.odp_port, upcall->ofp_in_port,
@@ -1366,6 +1402,12 @@ upcall_xlate(struct udpif *udpif, struct upcall *upcall,
     /* This function is also called for slow-pathed flows.  As we are only
      * going to create new datapath flows for actual datapath misses, there is
      * no point in creating a ukey otherwise. */
+    //创建ukey，作用是啥？和datapath的flow相关联
+    //DPIF_UC_MISS都创建ukey
+	//只有在数据路径实际缺失（miss）的情况下，才会为数据包创建新的 ukey。
+	//这是因为 ukey 用于跟踪和管理流表项的状态，如果数据包已经在数据路径中有对应的流表项，
+	//那么就没有必要创建新的 ukey。
+	//这里没有把ukey插入hash表，ukey插入hash表在后续的ukey_install_start函数中执行
     if (upcall->type == MISS_UPCALL) {
         upcall->ukey = ukey_create_from_upcall(upcall, wc);
     }
@@ -1704,6 +1746,7 @@ handle_upcalls(struct udpif *udpif, struct upcall *upcalls,
         const struct dp_packet *packet = upcall->packet;
         struct ukey_op *op;
 
+        //检查是否超过配置的flow限额，如果超过，不安装datapath
         if (should_install_flow(udpif, upcall)) {
             struct udpif_key *ukey = upcall->ukey;
 
@@ -1713,6 +1756,8 @@ handle_upcalls(struct udpif *udpif, struct upcall *upcalls,
             }
         }
 
+        //如果odp_actions size为0，说明报文需要被丢弃，因此不需要回送给内核处理，直接在ovs丢弃即可
+		//通知datapath如何处理当前upcall的报文
         if (upcall->odp_actions.size) {
             op = &ops[n_ops++];
             op->ukey = NULL;
@@ -1736,6 +1781,7 @@ handle_upcalls(struct udpif *udpif, struct upcall *upcalls,
         opsp[n_opsp++] = &ops[i].dop;
     }
     dpif_operate(udpif->dpif, opsp, n_opsp, DPIF_OFFLOAD_AUTO);
+
     for (i = 0; i < n_ops; i++) {
         struct udpif_key *ukey = ops[i].ukey;
 
@@ -1861,18 +1907,30 @@ ukey_create_from_upcall(struct upcall *upcall, struct flow_wildcards *wc)
 
     odp_parms.support = upcall->ofproto->backer->rt_support.odp;
     if (upcall->key_len) {
+    	//这里处理非dpdk场景下，kernel上送的报文都带上了key信息
+		//直接使用upcall报文key
         ofpbuf_use_const(&keybuf, upcall->key, upcall->key_len);
     } else {
+    	//dpdk的场景下,upcall_cb处理slowpath报文，对应的upcall->key都是NULL
+		//需要动态生成key
         /* dpif-netdev doesn't provide a netlink-formatted flow key in the
          * upcall, so convert the upcall's flow here. */
+    	//如果没有upcall报文key，根据报文的flow来间接转换成key
         ofpbuf_use_stack(&keybuf, &keystub, sizeof keystub);
+        //根据flow生成keybuf
         odp_flow_key_from_flow(&odp_parms, &keybuf);
     }
 
+    //是否使能了megaflow
     atomic_read_relaxed(&enable_megaflows, &megaflow);
+    //maskbuf指向maskstub的临时栈上空间
     ofpbuf_use_stack(&maskbuf, &maskstub, sizeof maskstub);
+    //根据wc生成maskbuf
+	//如果关闭了megaflow功能，maskbuf.size为0，下发到datapath则不带mask数据
+	//datapath默认生成全1的mask，表示精确匹配
     if (megaflow && wc) {
         odp_parms.key_buf = &keybuf;
+        //向maskbuf里写mask数据，以tlv的形式写入
         odp_flow_key_from_mask(&odp_parms, &maskbuf);
     }
 

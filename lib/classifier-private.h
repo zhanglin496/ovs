@@ -63,9 +63,14 @@ struct cls_subtable {
  */
 struct cls_match {
     /* Accessed by everybody. */
+	//这个是跟踪key相等，但是优先级不一样的规则
+	//ovs允许这样添加规则
+	//相同的匹配条件，根据优先级从高到低降序排序
     OVSRCU_TYPE(struct cls_match *) next; /* Equal, lower-priority matches. */
+    //是否时联合规则
     OVSRCU_TYPE(struct cls_conjunction_set *) conj_set;
 
+    //值越大优先级越高
     /* Accessed by readers interested in wildcarding. */
     const int priority;         /* Larger numbers are higher priorities. */
 
@@ -75,7 +80,9 @@ struct cls_match {
     /* Rule versioning. */
     struct versions versions;
 
+    //指向rule
     const struct cls_rule *cls_rule;
+    //flow 后面是实际的flow非0的data数据
     const struct miniflow flow; /* Matching rule. Mask is in the subtable. */
     /* 'flow' must be the last field. */
 };

@@ -50,8 +50,71 @@ BUILD_ASSERT_DECL(FLOW_N_REGS % 4 == 0); /* Handle xxregs. */
  * type, that is, pure 802.2 frames. */
 #define FLOW_DL_TYPE_NONE 0x5ff
 
+/*
+//no：只匹配不分片的报文。0
+//yes：匹配所有分片的报文。3
+//first：仅匹配第一个分片报文。1
+//later：仅匹配非0偏移的分片报文。2
+//not_later：匹配不分片的报文和第一个分片报文。1
+
+IPv4/v6 Fragment Bitmask Field
+Name:            ip_frag (aka nw_frag)
+Width:           8 bits (only the least-significant 2 bits may be nonzero)
+Format:          frag
+Masking:         arbitrary bitwise masks
+Prerequisites:   IPv4/IPv6
+Access:          read-only
+OpenFlow 1.0:    not supported
+OpenFlow 1.1:    not supported
+OXM:             none
+NXM:             NXM_NX_IP_FRAG (26) since Open vSwitch 1.3
+
+Specifies what kinds of IP fragments or non-fragments to match.
+The value for this field is most conveniently specified as one of
+the following:
+
+       no     Match only non-fragmented packets.
+
+       yes    Matches all fragments.
+
+       first  Matches only fragments with offset 0.
+
+       later  Matches only fragments with nonzero offset.
+
+       not_later
+              Matches non-fragmented packets and fragments with
+              zero offset.
+
+The field is internally formatted as 2 bits: bit 0 is 1 for an IP
+fragment with any offset (and otherwise 0), and bit 1 is 1 for an
+IP fragment with nonzero offset (and otherwise 0), like so:
+
+ NXM_NX_IP_FRAG
+ <------------>
+  6     1    1
++----+-----+---+
+|zero|later|any|
++----+-----+---+
+  0
+
+Even though 2 bits have 4 possible values, this field only uses 3
+of them:
+
+       •      A packet that is not an IP fragment has value 0.
+
+       •      A packet that is an IP fragment with offset 0 (the
+              first fragment) has bit 0 set and thus value 1.
+
+       •      A packet that is an IP fragment with nonzero offset
+              has bits 0 and 1 set and thus value 3.
+
+The switch may reject matches against values that can never
+appear.
+*/
 /* Fragment bits, used for IPv4 and IPv6, always zero for non-IP flows. */
+//0x1,表示数据包是第一个分片报文
 #define FLOW_NW_FRAG_ANY   (1 << 0) /* Set for any IP frag. */
+//0x2,表示数据包是分片的,但不是第一个分片（即偏移量不为0）
 #define FLOW_NW_FRAG_LATER (1 << 1) /* Set for IP frag with nonzero offset. */
 #define FLOW_NW_FRAG_MASK  (FLOW_NW_FRAG_ANY | FLOW_NW_FRAG_LATER)
 
@@ -97,8 +160,22 @@ BUILD_ASSERT_DECL(FLOW_MAX_VLAN_HEADERS % 2 == 0);
  * NOTE: Order of the fields is significant, any change in the order must be
  * reflected in miniflow_extract()!
  */
+/* 网络中的一个流。
+必须初始化为全零，以确保任何由编译器引入的填充被清零。
+这也有助于保持未使用的字段（如互斥的 IPv4 和 IPv6 地址）被清零。
+'in_port' 的含义是上下文相关的。在大多数情况下，它是一个
+16位的 OpenFlow 1.0 端口号。在软件数据路径接口（dpif）
+层及其实现中（例如 dpif-netlink, dpif-netdev），它是一个32位的数据路径端口号。
+字段被分成四个部分组织，以便于分阶段查找，其中较低层的字段首先被用来确定是否需要查看后面的字段。
+这使得数据路径流的通配符更加有效。注意：字段的顺序很重要，任何顺序的改变必须在miniflow_extract() 中反映出来！
+警告：此结构的任何更改都应在此文件中更新 FLOW_FIELDS。
+*/
+
+//用flow表示一个报文解析的一切信息
+//flow匹配算法要求必须8字节对齐
 struct flow {
     /* Metadata */
+	//隧道信息，包括外层ip地址和端口信息
     struct flow_tnl tunnel;     /* Encapsulating tunnel parameters. */
     ovs_be64 metadata;          /* OpenFlow Metadata. */
     uint32_t regs[FLOW_N_REGS]; /* Registers. */
@@ -106,7 +183,11 @@ struct flow {
     uint32_t pkt_mark;          /* Packet mark. */
     uint32_t dp_hash;           /* Datapath computed hash value. The exact
                                  * computation is opaque to the user space. */
+
+    //报文来自那个port
     union flow_in_port in_port; /* Input port.*/
+    //recirculate， 最初需求来自mpls，The initial use case is for MPLS support
+	//目前conntrack也在使用
     uint32_t recirc_id;         /* Must be exact match. */
     uint8_t ct_state;           /* Connection tracking state. */
     uint8_t ct_nw_proto;        /* CT orig tuple IP protocol. */
@@ -117,6 +198,8 @@ struct flow {
     uint32_t conj_id;           /* Conjunction ID. */
     ofp_port_t actset_output;   /* Output port in action set. */
 
+    //l2层信息
+	//FLOW_SEGMENT_1_ENDS_AT
     /* L2, Order the same as in the Ethernet header! (64-bit aligned) */
     struct eth_addr dl_dst;     /* Ethernet destination address. */
     struct eth_addr dl_src;     /* Ethernet source address. */
@@ -127,6 +210,9 @@ struct flow {
     union flow_vlan_hdr vlans[FLOW_MAX_VLAN_HEADERS]; /* VLANs */
     ovs_be32 mpls_lse[ROUND_UP(FLOW_MAX_MPLS_LABELS, 2)]; /* MPLS label stack
                                                              (with padding). */
+
+    //l3 信息
+    //FLOW_SEGMENT_2_ENDS_AT
     /* L3 (64-bit aligned) */
     ovs_be32 nw_src;            /* IPv4 source address or ARP SPA. */
     ovs_be32 nw_dst;            /* IPv4 destination address or ARP TPA. */
@@ -137,6 +223,11 @@ struct flow {
     struct in6_addr ct_ipv6_src; /* CT orig tuple IPv6 source address. */
     struct in6_addr ct_ipv6_dst; /* CT orig tuple IPv6 destination address. */
     ovs_be32 ipv6_label;        /* IPv6 flow label. */
+
+    //分片匹配标志。默认flow流表的key和mask都为0，表示匹配所有类型的报文
+	//对于datapath miss上送的分片报文，nw_frag的值为1或者2. ovs会转换成1和3再过pipeline
+	//详细看函数 odp_to_ovs_frag
+	//对于datapath miss上送的非分片报文，nw_frag的值为0
     uint8_t nw_frag;            /* FLOW_FRAG_* flags. */
     uint8_t nw_tos;             /* IP ToS (including DSCP and ECN). */
     uint8_t nw_ttl;             /* IP TTL/Hop Limit. */
@@ -148,8 +239,12 @@ struct flow {
     ovs_be16 tcp_flags;         /* TCP flags/ICMPv6 ND options type. */
     ovs_be16 pad2;              /* Pad to 64 bits. */
     struct ovs_key_nsh nsh;     /* Network Service Header keys */
-
+    //l3信息
+	//FLOW_SEGMENT_3_ENDS_AT
+	/* L4 (64-bit aligned) */
+	//对于icmp，表示icmp type
     ovs_be16 tp_src;            /* TCP/UDP/SCTP source port/ICMP type. */
+    //对于icmp，表示icmp code
     ovs_be16 tp_dst;            /* TCP/UDP/SCTP destination port/ICMP code. */
     ovs_be16 ct_tp_src;         /* CT original tuple source port/ICMP type. */
     ovs_be16 ct_tp_dst;         /* CT original tuple dst port/ICMP code. */
