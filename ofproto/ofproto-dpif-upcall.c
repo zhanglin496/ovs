@@ -2299,6 +2299,8 @@ xlate_key(struct udpif *udpif, const struct nlattr *key, unsigned int len,
     struct xlate_in xin;
     int error;
 
+    //需要重新验证datapath flow的有效性
+	//根据ukey中匹配信息转化成通用的flow流表，后续用于匹配
     fitness = odp_flow_key_to_flow(key, len, &ctx->flow, NULL);
     if (fitness == ODP_FIT_ERROR) {
         return EINVAL;
@@ -2413,6 +2415,7 @@ revalidate_ukey__(struct udpif *udpif, const struct udpif_key *ukey,
                           ofproto->up.slowpath_meter_id, &ofproto->uuid);
     }
 
+    //根据ukey的mask信息生成dp_mask
     if (odp_flow_key_to_mask(ukey->mask, ukey->mask_len, &dp_mask, &ctx.flow,
                              NULL)
         == ODP_FIT_ERROR) {
@@ -2430,6 +2433,8 @@ revalidate_ukey__(struct udpif *udpif, const struct udpif_key *ukey,
         goto exit;
     }
 
+    //mask未发生变化，需要对比现在的odp_actions和ukey中记录的old actions
+	//如发生了变化，表示需要修改datapath flow的action
     if (!ofpbuf_equal(odp_actions,
                       ovsrcu_get(struct ofpbuf *, &ukey->actions))) {
         /* The datapath mask was OK, but the actions seem to have changed.
@@ -2506,6 +2511,8 @@ revalidate_ukey(struct udpif *udpif, struct udpif_key *ukey,
     ofpbuf_clear(odp_actions);
 
     push.used = stats->used;
+
+    //计算数据增量，用于更新rule命中的统计数据
     push.tcp_flags = stats->tcp_flags;
     push.n_packets = stats->n_packets - ukey->stats.n_packets;
     push.n_bytes = stats->n_bytes - ukey->stats.n_bytes;
@@ -2537,6 +2544,8 @@ revalidate_ukey(struct udpif *udpif, struct udpif_key *ukey,
         result = UKEY_KEEP;
     }
 
+    //更新统计数据等
+    //这里如果缓存了xcache，包括命中的rule记录列表，不需要去重新走流水线匹配流表
     /* Stats for deleted flows will be attributed upon flow deletion. Skip. */
     if (result != UKEY_DELETE) {
         xlate_push_stats(ukey->xcache, &push, ukey->offloaded);
@@ -2938,12 +2947,18 @@ revalidate(struct revalidator *revalidator)
             bool already_dumped;
             int error;
 
+            //根据flow去找ukey，必须获取一个有效的ukey
+            //设计上每个datapacth数据路径流都有一个ovs对应的ukey，它缓存了最近看到的统计数据
+            //为什么要创建udpif_key，根据ovs的设计描述是因为有些数据无法从datapath获取。
+            //第二个是加速统计数据更新，因为datapath可能对应多个命中的flow rule，udpif_key缓存了命中的rule
+            //这样就不需要去重新匹配流水线
             if (ukey_acquire(udpif, f, &ukey, &error)) {
                 if (error == EBUSY) {
                     /* Another thread is processing this flow, so don't bother
                      * processing it.*/
                     COVERAGE_INC(upcall_ukey_contention);
                 } else {
+                	//非ENOENT值，删除datapath
                     log_unexpected_flow(f, error);
                     if (error != ENOENT) {
                         delete_op_init__(udpif, &ops[n_ops++], f);
@@ -2967,7 +2982,8 @@ revalidate(struct revalidator *revalidator)
                 }
                 ukey->dp_layer = f->attrs.dp_layer;
             }
-
+            //因为有多个revalidator线程，可能其他线程已经处理完成
+			//或者是upcall流程刚创建ukey
             already_dumped = ukey->dump_seq == dump_seq;
             if (already_dumped) {
                 /* The flow has already been handled during this flow dump
@@ -3004,6 +3020,9 @@ revalidate(struct revalidator *revalidator)
             if (!used) {
                 used = udpif_update_used(udpif, ukey, &stats);
             }
+
+            //used 表示flow最近被用的时间，如果超了max_idle这么长时间不被使用就会被删除。
+			//比如只创建了一条flow，max_idle就是默认的10s，如果10s内此flow没有流量，则会被删除。
             if (kill_them_all || (used && used < now - max_idle)) {
                 result = UKEY_DELETE;
                 del_reason = (kill_them_all) ? FDR_FLOW_LIMIT : FDR_FLOW_IDLE;
@@ -3020,6 +3039,9 @@ revalidate(struct revalidator *revalidator)
 
             OVS_USDT_PROBE(revalidate, flow_result, udpif, ukey, result,
                            del_reason);
+
+            //如果结果不是keep，则需要根据结果(删除/修改)初始化ops
+			//这里只是删除kernel datapath的流表，并不是删除ovs的flow流表
             if (result != UKEY_KEEP) {
                 /* Takes ownership of 'recircs'. */
                 reval_op_init(&ops[n_ops++], result, udpif, ukey, &recircs,
@@ -3028,6 +3050,7 @@ revalidate(struct revalidator *revalidator)
             ovs_mutex_unlock(&ukey->mutex);
         }
 
+        //执行删除/修改操作，这里并不删除ukey，ukey在sweep中删除
         if (n_ops) {
             /* Push datapath ops but defer ukey deletion to 'sweep' phase. */
             push_dp_ops(udpif, ops, n_ops);
